@@ -1,4 +1,4 @@
-;;; cppref.el --- A Simple C++ Reference Viewer
+;;; cppref.el --- A Simple cppreference.com Browser
 
 ;; Copyright (C) 2009 Kentaro Kuribayashi
 
@@ -24,109 +24,106 @@
 
 ;; * Description
 
-;; cppref.el is a port of Perl's cppref command, a simple C++
-;; reference viewer working on a terminal.
+;; This library provides a simple interface to cppreference.com's offline
+;; archives.
 
 ;; * Usage
-;;
-;; cppref.el requires cl installed in advance. So, add
-;; the lines below into your .emacs:
+
+;; Add the lines below into your .emacs:
 ;;
 ;;   (require 'cppref)
 ;;
-;; File viewing is handled by browse-url. You can customize the browser
-;; with the option variable browse-url-browser-function.
+;; File viewing is handled by `browse-url'.  You can customize the browser used
+;; by setting the variable `browse-url-browser-function' appropriately.
 ;;
-;; Althogh cppref.el automatically find out the place of
-;; documentation, if you want to put your the directory at some other
-;; place, you must add one more line like below:
+;; You also need a copy of cppreference.com's offline archives (the "HTML book").
+;; It can be  downloaded from https://en.cppreference.com/w/Cppreference:Archives.
+;; Unpack the archive in a directory of your choice.  The default location for
+;; the cppreference.com archive is
 ;;
-;;   (setq cppref-doc-dir "/path/to/dir") ;; doesn't end with "/"
+;;   /usr/share/doc/cppreference
 ;;
-;; Then run `cppref' command and type like "vector::begin",
-;; "io::fopen", or so.
+;; This can be customized using the variable `cppref-doc-dir'.
+;;
+;; Then run `cppref' command and type something like "vector::begin", or
+;; "io::fopen".
 
-;;; Acknowledment:
+;;; Acknowledgments:
 
-;; cppref.el is Emacs version of Kazuho Oku's cppref command
+;; cppref.el is the Emacs version of Kazuho Oku's cppref command
 ;; http://search.cpan.org/dist/cppref/
-
-;; The documents are from http://www.cppreference.com/ (under Creative
-;; Commons Attribution 3.0 license).
 
 ;;; Code:
 
-(eval-when-compile
-  (require 'cl)
-  (load "find-func") ;; for `find-library-name' to be loaded.
-  )
+(require 'thingatpt)
+(require 'cl-lib)
 
-(defvar cppref-doc-dir nil
-  "Your local directory in which C++ references are placed")
+(defvar cppref-doc-dir "/usr/share/doc/cppreference"
+  "*Location of the cppreference.com offline archive.
+The archive can be downloaded from https://en.cppreference.com/w/Cppreference:Archives.")
 
-(defun cppref (name)
-  "Show C++ reference along with arg `name' using w3m web
-browser."
-  (interactive "sName: ")
-  (cppref-init-doc-dir)
-  (let ((candidates nil)
-        (reference nil))
-    (when (string-equal name "")
-      (setq name "start"))
+(defun cppref--read-keyword ()
+  (let* ((sap (symbol-at-point))
+         (default (and sap (symbol-name sap))))
+    (read-string (format-prompt "Keyword" default) nil nil default)))
 
-    ;; replace "class::method" to "class/method"
-    (setq name (replace-regexp-in-string "::" "/" name))
+(defun cppref--remove-dir-prefix (dir fn)
+  (substring fn (length (file-name-as-directory dir)) nil))
 
-    ;; directory index is like ***/start.html
-    (when (file-directory-p (concat cppref-doc-dir "/" name))
-      (setq name (concat name "/start")))
+(defun cppref--select-match (prompt matches)
+  (let ((items (mapcar (lambda (fn) (cppref--remove-dir-prefix cppref-doc-dir fn)) matches)))
+    (file-name-concat cppref-doc-dir (completing-read prompt items nil t))))
 
-    (setq candidates
-          (let ((file (concat cppref-doc-dir "/" name ".html")))
-            (if (file-exists-p file)
-                (list file)
-              (cppref-find-reference cppref-doc-dir name))))
+(defun cppref (keyword)
+  "Search cppreference.com archive for KEYWORD."
+  (interactive (list (cppref--read-keyword)))
+  (cppref-check-doc-dir)
+  (let ((matches (cppref-find-reference cppref-doc-dir keyword)))
+    (cond
+     ((null matches)
+      (error "Nothing found for \"%s\"" keyword))
+     ((length= matches 1)
+      (cppref-visit-reference (car matches)))
+     (t
+      (let ((reference (cppref--select-match (format "cppref matches for \"%s\": " keyword) matches)))
+        (cppref-visit-reference reference))))))
 
-    (setq reference  (car candidates))
-    (setq candidates (cdr candidates))
+(defun cppref-check-doc-dir ()
+  (unless (and cppref-doc-dir (file-directory-p cppref-doc-dir))
+    (error "Directory `%s' does not exist" cppref-doc-dir)))
 
-    (if (not reference)
-        (error (concat "no document found for " name)))
-    (if candidates
-	(setq reference (cppref-select-from-multiple-choices
-			 candidates)))
-    (cppref-visit-reference reference)))
-
-(defun cppref-select-from-multiple-choices (choices)
-  (completing-read "multiple choies. push tab key. select :" choices nil t ""))
-
-(defun cppref-init-doc-dir ()
-  (if (not cppref-doc-dir)
-      (let* ((library-path (find-library-name "cppref"))
-             (library-root (file-name-directory library-path)))
-        (setq cppref-doc-dir (concat library-root "docs")))))
+(defun cppref-find-reference (dir keyword)
+  ;; Handle qualified names like "vector::begin" by first searching for "begin"
+  ;; and later refining the match.
+  (let* ((components (split-string keyword "::"))
+         (base (car (last components)))
+         (qualifiers (nbutlast components))
+         (regexp (if qualifiers
+                     (rx-to-string `(seq string-start ,base (* anychar) ".html" string-end))
+                   (rx-to-string `(seq ,base (* anychar) ".html" string-end))))
+         (matches (directory-files-recursively dir regexp)))
+    ;; If the symbol name is qualified we try to return a match as exact as
+    ;; possible.  Otherwise return all matches found.  For example, we return a
+    ;; single match for "vector::swap" but in case of "swap" (unqualified) also
+    ;; return matches for "swap2".
+    (if qualifiers
+        (let* ((refined
+                (cl-remove-if-not
+                 (lambda (fn)
+                   (string-match-p (rx-to-string `(seq "/" ,(replace-regexp-in-string "::" "/" keyword))) fn))
+                 matches))
+               (exact
+                (cl-remove-if-not
+                 (lambda (fn)
+                   (string-match-p (rx-to-string `(seq "/" ,(replace-regexp-in-string "::" "/" keyword) ".html" string-end)) fn))
+                 refined)))
+          (if (length> exact 0)
+              exact
+            refined))
+      matches)))
 
 (defun cppref-visit-reference (reference)
   (browse-url reference))
-
-(defun cppref-find-reference (dir name)
-  (let ((candidates '())
-        (reference  nil)
-        (absolute-path nil))
-    (loop for fn
-          in (directory-files dir)
-          do (setq absolute-path (concat dir "/" fn))
-             (if (file-directory-p absolute-path)
-                 (when (and (not (string-equal fn "."))
-                            (not (string-equal fn "..")))
-                   (if (string-match (concat name "$") absolute-path)
-                       (push (concat absolute-path "/start.html") candidates)
-                     (setq candidates
-                           (append (cppref-find-reference absolute-path name)
-                                   candidates))))
-               (when (string-match (concat name "\\.html$") absolute-path)
-                 (push absolute-path candidates))))
-    candidates))
 
 (provide 'cppref)
 ;;; cppref.el ends here
